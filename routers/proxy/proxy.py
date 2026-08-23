@@ -26,12 +26,10 @@ def _text(value):
 
 
 def _innertube_related_to_invidious(raw):
-    """Convert youtubei.js watch-next items to Invidious-compatible cards."""
     if isinstance(raw, dict):
         items = raw.get("related") or raw.get("videos") or raw.get("items") or []
     else:
         items = raw if isinstance(raw, list) else []
-
     out = []
     for item in items:
         if not isinstance(item, dict):
@@ -39,25 +37,17 @@ def _innertube_related_to_invidious(raw):
         vid = item.get("videoId") or item.get("video_id") or item.get("id")
         if not vid:
             continue
-        title = _text(item.get("title"))
-        if not title:
-            title = _text(item.get("headline"))
         thumbs = item.get("thumbnails") or item.get("thumbnail") or []
         if isinstance(thumbs, dict):
             thumbs = thumbs.get("thumbnails") or []
-        author = _text(item.get("author") or item.get("owner"))
-        author_id = item.get("authorId") or item.get("author_id") or item.get("channelId") or ""
-        length = item.get("lengthSeconds") or item.get("duration") or item.get("duration_seconds") or 0
-        views = item.get("viewCount") or item.get("view_count") or 0
-        published = _text(item.get("publishedText") or item.get("published"))
         out.append({
             "videoId": str(vid),
-            "title": title,
-            "author": author,
-            "authorId": author_id,
-            "lengthSeconds": length,
-            "viewCount": views,
-            "publishedText": published,
+            "title": _text(item.get("title") or item.get("headline")),
+            "author": _text(item.get("author") or item.get("owner")),
+            "authorId": item.get("authorId") or item.get("author_id") or item.get("channelId") or "",
+            "lengthSeconds": item.get("lengthSeconds") or item.get("duration") or 0,
+            "viewCount": item.get("viewCount") or item.get("view_count") or 0,
+            "publishedText": _text(item.get("publishedText") or item.get("published")),
             "authorThumbnails": [],
             "videoThumbnails": thumbs if isinstance(thumbs, list) else [],
         })
@@ -67,14 +57,37 @@ def _innertube_related_to_invidious(raw):
 async def _fetch_innertube_related(video_id: str):
     try:
         client = await get_client()
-        resp = await client.get(
-            f"{INNERTUBE_BASE}/video/{video_id}/related",
-            timeout=12,
-        )
+        resp = await client.get(f"{INNERTUBE_BASE}/video/{video_id}/related", timeout=12)
         resp.raise_for_status()
         return _innertube_related_to_invidious(resp.json())
     except Exception:
         return []
+
+
+async def _fetch_innertube_home():
+    try:
+        client = await get_client()
+        resp = await client.get(f"{INNERTUBE_BASE}/home", timeout=15)
+        resp.raise_for_status()
+        raw = resp.json()
+        # youtubei.js HomeFeed の items/videos から動画カードだけを抽出
+        items = raw.get("videos") or raw.get("items") or [] if isinstance(raw, dict) else []
+        return _innertube_related_to_invidious(items)
+    except Exception:
+        return []
+
+
+@router.get("/proxy/main/api/home")
+async def proxy_home():
+    """Home feed: Innertubeを優先し、YouTubeホームが空でも動画カードを返す。"""
+    data = await _fetch_innertube_home()
+    if data:
+        return JSONResponse(data, headers={"X-Source": "innertube"})
+    try:
+        result = await proxy_parallel("popular", "/api/v1/popular")
+        return JSONResponse(result["data"], headers={"X-Source": "invidious"})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
 
 
 @router.get("/proxy/main/{path:path}")
@@ -90,51 +103,36 @@ async def proxy_main(path: str, request: Request):
     if ch_match:
         inv_cont_in = request.query_params.get("continuation")
         innertube_cont_key = _innertube_cont_get(channel_id, tab, inv_cont_in) if inv_cont_in else None
-
-        invidious_task = asyncio.create_task(
-            proxy_parallel(category, invidious_path, prefer_valid_videos=True)
-        )
+        invidious_task = asyncio.create_task(proxy_parallel(category, invidious_path, prefer_valid_videos=True))
         if innertube_cont_key:
             innertube_task = asyncio.create_task(fetch_innertube_continuation(innertube_cont_key))
         else:
             innertube_task = asyncio.create_task(fetch_innertube_videos(channel_id, tab))
-
         innertube_result = ([], None)
         try:
             innertube_result = await asyncio.wait_for(innertube_task, timeout=8.0)
         except (asyncio.TimeoutError, Exception):
             innertube_result = ([], None)
-
         try:
             inv_result = await invidious_task
         except Exception as e:
             inv_result = e
-
-        innertube_items, new_innertube_cont_key = (
-            innertube_result if isinstance(innertube_result, tuple) else (innertube_result, None)
-        )
-
+        innertube_items, new_innertube_cont_key = innertube_result if isinstance(innertube_result, tuple) else (innertube_result, None)
         if isinstance(inv_result, Exception):
             if innertube_items:
                 fallback = _innertube_to_invidious(innertube_items, channel_id)
                 return JSONResponse(fallback if tab == "latest" else {"videos": fallback, "continuation": None})
             return JSONResponse({"error": str(inv_result)}, status_code=502)
-
         if new_innertube_cont_key:
             inv_data = inv_result["data"]
             inv_cont_out = inv_data.get("continuation") if isinstance(inv_data, dict) else None
             if inv_cont_out:
                 _innertube_cont_set(channel_id, tab, inv_cont_out, new_innertube_cont_key)
-
-        data = _apply_enrichment(inv_result["data"], innertube_items, channel_id)
-        return JSONResponse(data)
+        return JSONResponse(_apply_enrichment(inv_result["data"], innertube_items, channel_id))
 
     try:
         result = await proxy_parallel(category, invidious_path)
         data = result["data"]
-
-        # Invidiousの動画APIがrecommendedVideosを返さない/空の場合、
-        # 同じ動画をInnertube側から取得して関連動画を補完する。
         if category == "video" and isinstance(data, dict):
             related = data.get("recommendedVideos") or data.get("relatedVideos") or []
             if not related:
@@ -144,10 +142,8 @@ async def proxy_main(path: str, request: Request):
                     if fallback:
                         data["recommendedVideos"] = fallback
                         data["_relatedSource"] = "innertube"
-
         return JSONResponse(data)
     except Exception as e:
-        # 動画関連だけは、Invidiousが全滅してもInnertubeから復旧を試みる。
         if category == "video":
             video_id = app_path.split("/api/stream/", 1)[-1].split("?", 1)[0]
             fallback = await _fetch_innertube_related(video_id) if video_id else []
@@ -164,18 +160,13 @@ async def proxy_stream(path: str, request: Request):
         qs = urlencode(params) if params else ""
         app_path = "/" + path + ("?" + qs if qs else "")
         _, invidious_path = map_path(app_path)
-
         try:
             vb_instances = await get_video_back_instances()
         except Exception:
             vb_instances = []
         if not vb_instances:
             vb_instances = await get_instances("video")
-
-        result = await proxy_parallel(
-            "video", invidious_path, exclude_list,
-            prefer_valid_stream=True, override_instances=vb_instances,
-        )
+        result = await proxy_parallel("video", invidious_path, exclude_list, prefer_valid_stream=True, override_instances=vb_instances)
         headers = {}
         if result.get("used_instance"):
             headers["X-Instance-Used"] = result["used_instance"]
