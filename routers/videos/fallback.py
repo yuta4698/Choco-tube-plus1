@@ -9,6 +9,16 @@ from core import INNERTUBE_BASE, get_client, proxy_parallel
 
 router = APIRouter()
 
+# Piped publishes a live public-instance list, but keeping a small set of
+# known API endpoints here prevents one dead instance from breaking playback.
+PIPED_APIS = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.leptons.xyz",
+    "https://pipedapi.adminforge.de",
+    "https://api.piped.yt",
+    "https://pipedapi.privacy.com.de",
+]
+
 
 def _text(v: Any) -> str:
     if isinstance(v, str):
@@ -28,21 +38,18 @@ def _thumbs(v: dict) -> list:
     t = v.get("videoThumbnails") or v.get("thumbnails") or v.get("thumbnail") or []
     if isinstance(t, dict):
         t = t.get("thumbnails") or []
+    if isinstance(t, str):
+        return [{"url": t}]
     return t if isinstance(t, list) else []
 
 
-def normalize_video(raw: Any) -> dict | None:
-    if not isinstance(raw, dict):
-        return None
-    # Some helper versions wrap the actual object.
-    for key in ("video", "data", "result"):
-        if isinstance(raw.get(key), dict) and (raw[key].get("videoId") or raw[key].get("id") or raw[key].get("title")):
-            raw = raw[key]
-            break
-
-    related_raw = raw.get("recommendedVideos") or raw.get("relatedVideos") or raw.get("related") or raw.get("relatedStreams") or []
-    related = []
-    for item in related_raw:
+def normalize_related(items: Any) -> list:
+    if isinstance(items, dict):
+        items = items.get("relatedStreams") or items.get("relatedVideos") or items.get("recommendedVideos") or items.get("videos") or items.get("items") or []
+    if not isinstance(items, list):
+        return []
+    out = []
+    for item in items:
         if not isinstance(item, dict):
             continue
         vid = _id(item)
@@ -50,20 +57,37 @@ def normalize_video(raw: Any) -> dict | None:
             url = item.get("url") or ""
             if "?v=" in url:
                 vid = url.split("?v=", 1)[1].split("&", 1)[0]
+            elif "/watch/" in url:
+                vid = url.rsplit("/watch/", 1)[1].split("?", 1)[0]
         if not vid:
             continue
-        related.append({
+        thumb = item.get("thumbnail")
+        thumbs = _thumbs(item)
+        if thumb and not thumbs:
+            thumbs = [{"url": thumb}]
+        out.append({
             "videoId": vid,
-            "title": _text(item.get("title") or item.get("headline")),
-            "author": _text(item.get("author") or item.get("uploaderName") or item.get("owner")),
-            "authorId": item.get("authorId") or item.get("channelId") or "",
-            "lengthSeconds": item.get("lengthSeconds") or item.get("duration") or 0,
-            "viewCount": item.get("viewCount") or item.get("views") or 0,
-            "publishedText": _text(item.get("publishedText") or item.get("uploadedDate") or item.get("published")),
-            "authorThumbnails": item.get("authorThumbnails") or [],
-            "videoThumbnails": _thumbs(item),
+            "title": _text(item.get("title")),
+            "author": _text(item.get("uploaderName") or item.get("author") or item.get("owner")),
+            "authorId": item.get("uploaderUrl") or item.get("authorId") or item.get("channelId") or "",
+            "lengthSeconds": item.get("duration") or item.get("lengthSeconds") or 0,
+            "viewCount": item.get("views") or item.get("viewCount") or 0,
+            "publishedText": _text(item.get("uploadedDate") or item.get("publishedText")),
+            "authorThumbnails": ([{"url": item.get("uploaderAvatar")}] if item.get("uploaderAvatar") else []),
+            "videoThumbnails": thumbs,
         })
+    return out
 
+
+def normalize_video(raw: Any) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    for key in ("video", "data", "result"):
+        if isinstance(raw.get(key), dict) and (raw[key].get("videoId") or raw[key].get("id") or raw[key].get("title")):
+            raw = raw[key]
+            break
+
+    related = normalize_related(raw)
     vid = _id(raw)
     title = _text(raw.get("title"))
     if not vid and not title:
@@ -71,11 +95,11 @@ def normalize_video(raw: Any) -> dict | None:
     return {
         "videoId": vid,
         "title": title,
-        "author": _text(raw.get("author") or raw.get("uploader") or raw.get("owner")),
-        "authorId": raw.get("authorId") or raw.get("channelId") or "",
+        "author": _text(raw.get("author") or raw.get("uploaderName") or raw.get("uploader") or raw.get("owner")),
+        "authorId": raw.get("authorId") or raw.get("channelId") or raw.get("uploaderUrl") or "",
         "viewCount": raw.get("viewCount") or raw.get("views") or 0,
         "likeCount": raw.get("likeCount") or raw.get("likes") or 0,
-        "publishedText": _text(raw.get("publishedText") or raw.get("published")),
+        "publishedText": _text(raw.get("publishedText") or raw.get("uploadedDate") or raw.get("published")),
         "description": raw.get("description") or "",
         "descriptionHtml": raw.get("descriptionHtml") or raw.get("description") or "",
         "lengthSeconds": raw.get("lengthSeconds") or raw.get("duration") or 0,
@@ -85,7 +109,7 @@ def normalize_video(raw: Any) -> dict | None:
         "authorThumbnails": raw.get("authorThumbnails") or [],
         "videoThumbnails": _thumbs(raw),
         "recommendedVideos": related,
-        "_source": "innertube-fallback",
+        "_source": "piped-fallback",
     }
 
 
@@ -96,8 +120,25 @@ async def _helper_get(path: str, timeout: float = 18.0):
     return r.json()
 
 
+async def _piped_get(path: str, timeout: float = 15.0):
+    client = await get_client()
+    last = None
+    for base in PIPED_APIS:
+        try:
+            r = await client.get(f"{base}{path}", timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            if data:
+                return data
+        except Exception as exc:
+            last = exc
+            continue
+    if last:
+        raise last
+    return None
+
+
 async def _helper_video(video_id: str) -> dict | None:
-    # Keep the primary contract used by the companion Innertube service.
     for path in (f"/video/{video_id}", f"/video/{video_id}/info"):
         try:
             data = await _helper_get(path)
@@ -112,21 +153,55 @@ async def _helper_video(video_id: str) -> dict | None:
 async def _helper_related(video_id: str) -> list:
     try:
         data = await _helper_get(f"/video/{video_id}/related")
-        if isinstance(data, dict):
-            data = data.get("relatedVideos") or data.get("recommendedVideos") or data.get("related") or data.get("videos") or data.get("items") or []
-        if not isinstance(data, list):
-            return []
-        dummy = normalize_video({"videoId": video_id, "title": "", "recommendedVideos": data})
-        return (dummy or {}).get("recommendedVideos", [])
+        return normalize_related(data)
+    except Exception:
+        return []
+
+
+async def _piped_video(video_id: str) -> dict | None:
+    try:
+        data = await _piped_get(f"/streams/{video_id}")
+        result = normalize_video(data)
+        if result:
+            return result
+    except Exception:
+        pass
+    return None
+
+
+async def _piped_channel(channel_id: str) -> dict | None:
+    try:
+        data = await _piped_get(f"/channel/{channel_id}", timeout=18.0)
+        if not isinstance(data, dict):
+            return None
+        videos = normalize_related(data.get("relatedStreams") or [])
+        return {
+            "author": {
+                "author": data.get("name") or "",
+                "authorId": data.get("id") or channel_id,
+                "authorThumbnails": ([{"url": data.get("avatarUrl")}] if data.get("avatarUrl") else []),
+                "authorBanner": data.get("bannerUrl") or "",
+                "description": data.get("description") or "",
+                "subCount": data.get("subscriberCount") or 0,
+                "authorVerified": data.get("verified") or False,
+            },
+            "videos": videos,
+            "_source": "piped-fallback",
+        }
+    except Exception:
+        return None
+
+
+async def _piped_trending():
+    try:
+        data = await _piped_get("/trending?region=JP", timeout=18.0)
+        return normalize_related(data)
     except Exception:
         return []
 
 
 @router.get("/api/videoinfo/{video_id}")
 async def fallback_videoinfo(video_id: str, nocache: bool = False):
-    # Use all independent providers concurrently.  The old route depended on
-    # Invidious/Piped only, which is why both video info and related videos
-    # collapsed to 502 when those providers were unavailable.
     async def inv():
         try:
             r = await proxy_parallel("video", f"/api/v1/videos/{video_id}")
@@ -134,35 +209,37 @@ async def fallback_videoinfo(video_id: str, nocache: bool = False):
         except Exception:
             return None
 
-    async def helper():
-        return await _helper_video(video_id)
-
-    results = await asyncio.gather(inv(), helper(), return_exceptions=True)
+    # The companion Innertube service can be cold/unavailable. Piped is an
+    # independent provider and its /streams endpoint also includes relatedStreams.
+    results = await asyncio.gather(inv(), _helper_video(video_id), _piped_video(video_id), return_exceptions=True)
     for result in results:
         if isinstance(result, dict) and not result.get("error"):
             normalized = result if result.get("_source") else normalize_video(result)
             if normalized:
                 if not normalized.get("recommendedVideos"):
                     normalized["recommendedVideos"] = await _helper_related(video_id)
+                if not normalized.get("recommendedVideos"):
+                    piped = await _piped_video(video_id)
+                    if piped:
+                        normalized["recommendedVideos"] = piped.get("recommendedVideos", [])
                 return JSONResponse(normalized)
 
-    # If the full helper video endpoint is unavailable, related can still be
-    # useful to the client and gives a graceful response instead of 502.
     related = await _helper_related(video_id)
+    if not related:
+        piped = await _piped_video(video_id)
+        related = (piped or {}).get("recommendedVideos", [])
     if related:
         return JSONResponse({
             "videoId": video_id,
             "title": "",
             "recommendedVideos": related,
-            "_source": "innertube-related-fallback",
+            "_source": "related-fallback",
         })
     return JSONResponse({"error": "動画情報の取得に失敗しました"}, status_code=502)
 
 
 @router.get("/api/channel-home/{channel_id}")
 async def fallback_channel_home(channel_id: str):
-    # The companion service is still preferred because it returns the exact
-    # channel-home shape expected by the existing UI.
     try:
         data = await _helper_get(f"/channel/{channel_id}", timeout=20)
         if isinstance(data, dict):
@@ -170,7 +247,10 @@ async def fallback_channel_home(channel_id: str):
     except Exception:
         pass
 
-    # Graceful local fallback: return channel metadata plus the latest videos.
+    piped = await _piped_channel(channel_id)
+    if piped:
+        return JSONResponse(piped)
+
     try:
         channel_task = asyncio.create_task(proxy_parallel("channel", f"/api/v1/channels/{channel_id}"))
         videos_task = asyncio.create_task(proxy_parallel("channel_latest", f"/api/v1/channels/{channel_id}/videos?sort_by=newest"))
@@ -184,5 +264,17 @@ async def fallback_channel_home(channel_id: str):
             "videos": videos if isinstance(videos, list) else [],
             "_source": "invidious-fallback",
         })
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+@router.get("/api/home")
+async def fallback_home():
+    videos = await _piped_trending()
+    if videos:
+        return JSONResponse(videos, headers={"X-Source": "piped"})
+    try:
+        r = await proxy_parallel("popular", "/api/v1/popular")
+        return JSONResponse(r.get("data", []), headers={"X-Source": "invidious"})
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
