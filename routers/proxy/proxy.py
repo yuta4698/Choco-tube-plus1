@@ -5,14 +5,76 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from core import (
-    CHANNEL_VIDEO_CATEGORIES, _CH_TAB_RE,
+    CHANNEL_VIDEO_CATEGORIES, INNERTUBE_BASE, _CH_TAB_RE,
     _apply_enrichment, _innertube_cont_get, _innertube_cont_set,
     _innertube_to_invidious, fetch_innertube_continuation,
     fetch_innertube_videos, get_instances, get_video_back_instances,
-    map_path, proxy_parallel,
+    get_client, map_path, proxy_parallel,
 )
 
 router = APIRouter()
+
+
+def _text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return value.get("text") or value.get("simpleText") or ""
+    if isinstance(value, list):
+        return "".join(_text(x) for x in value)
+    return str(value or "")
+
+
+def _innertube_related_to_invidious(raw):
+    """Convert youtubei.js watch-next items to Invidious-compatible cards."""
+    if isinstance(raw, dict):
+        items = raw.get("related") or raw.get("videos") or raw.get("items") or []
+    else:
+        items = raw if isinstance(raw, list) else []
+
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        vid = item.get("videoId") or item.get("video_id") or item.get("id")
+        if not vid:
+            continue
+        title = _text(item.get("title"))
+        if not title:
+            title = _text(item.get("headline"))
+        thumbs = item.get("thumbnails") or item.get("thumbnail") or []
+        if isinstance(thumbs, dict):
+            thumbs = thumbs.get("thumbnails") or []
+        author = _text(item.get("author") or item.get("owner"))
+        author_id = item.get("authorId") or item.get("author_id") or item.get("channelId") or ""
+        length = item.get("lengthSeconds") or item.get("duration") or item.get("duration_seconds") or 0
+        views = item.get("viewCount") or item.get("view_count") or 0
+        published = _text(item.get("publishedText") or item.get("published"))
+        out.append({
+            "videoId": str(vid),
+            "title": title,
+            "author": author,
+            "authorId": author_id,
+            "lengthSeconds": length,
+            "viewCount": views,
+            "publishedText": published,
+            "authorThumbnails": [],
+            "videoThumbnails": thumbs if isinstance(thumbs, list) else [],
+        })
+    return out
+
+
+async def _fetch_innertube_related(video_id: str):
+    try:
+        client = await get_client()
+        resp = await client.get(
+            f"{INNERTUBE_BASE}/video/{video_id}/related",
+            timeout=12,
+        )
+        resp.raise_for_status()
+        return _innertube_related_to_invidious(resp.json())
+    except Exception:
+        return []
 
 
 @router.get("/proxy/main/{path:path}")
@@ -69,8 +131,28 @@ async def proxy_main(path: str, request: Request):
 
     try:
         result = await proxy_parallel(category, invidious_path)
-        return JSONResponse(result["data"])
+        data = result["data"]
+
+        # Invidiousの動画APIがrecommendedVideosを返さない/空の場合、
+        # 同じ動画をInnertube側から取得して関連動画を補完する。
+        if category == "video" and isinstance(data, dict):
+            related = data.get("recommendedVideos") or data.get("relatedVideos") or []
+            if not related:
+                video_id = app_path.split("/api/stream/", 1)[-1].split("?", 1)[0]
+                if video_id:
+                    fallback = await _fetch_innertube_related(video_id)
+                    if fallback:
+                        data["recommendedVideos"] = fallback
+                        data["_relatedSource"] = "innertube"
+
+        return JSONResponse(data)
     except Exception as e:
+        # 動画関連だけは、Invidiousが全滅してもInnertubeから復旧を試みる。
+        if category == "video":
+            video_id = app_path.split("/api/stream/", 1)[-1].split("?", 1)[0]
+            fallback = await _fetch_innertube_related(video_id) if video_id else []
+            if fallback:
+                return JSONResponse({"recommendedVideos": fallback, "_source": "innertube"})
         return JSONResponse({"error": str(e)}, status_code=502)
 
 
