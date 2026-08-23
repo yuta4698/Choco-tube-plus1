@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 import core
 from routers import pages, static
 from routers.proxy import proxy, thumb
-from routers.videos import watch, channel, shorts, search, download, fallback
+from routers.videos import watch, channel, shorts, search, download, fallback, direct
 from routers.tool import youtube as tool_youtube
 from routers.tool import game as tool_game
 from routers.tool import programing as tool_programing
@@ -55,8 +55,10 @@ app = FastAPI(lifespan=lifespan)
 
 app.include_router(proxy.router)
 app.include_router(thumb.router)
-# Must be registered before watch.py/channel.py: these routes intentionally
-# override the old provider-only endpoints with Innertube fallbacks.
+# Direct YouTube InnerTube must be registered before the older provider-only
+# routes so /api/videoinfo uses player + next first, like wkt's getInfo().
+app.include_router(direct.router)
+# Keep the broader fallback provider as a second layer.
 app.include_router(fallback.router)
 app.include_router(shorts.router)
 app.include_router(watch.router)
