@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 import core
 from routers import pages, static
 from routers.proxy import proxy, thumb
-from routers.videos import watch, channel, shorts, search, download
+from routers.videos import watch, channel, shorts, search, download, fallback
 from routers.tool import youtube as tool_youtube
 from routers.tool import game as tool_game
 from routers.tool import programing as tool_programing
@@ -22,7 +22,6 @@ AUTH_COOKIE_NAME = "choco_auth"
 AUTH_COOKIE_VALUE = "choco_session_ok"
 CF_WORKER_URL = "https://api-nemu.myproxy0108.workers.dev"
 
-# パスを完全一致 or prefix で許可するリスト（ログイン不要）
 _PUBLIC_EXACT = {"/login", "/api/login", "/forgot", "/api/quiz-login", "/whats", "/version"}
 _PUBLIC_PREFIX = ("/static/", "/photo/", "/proxy/", "/thumb/")
 
@@ -56,6 +55,9 @@ app = FastAPI(lifespan=lifespan)
 
 app.include_router(proxy.router)
 app.include_router(thumb.router)
+# Must be registered before watch.py/channel.py: these routes intentionally
+# override the old provider-only endpoints with Innertube fallbacks.
+app.include_router(fallback.router)
 app.include_router(shorts.router)
 app.include_router(watch.router)
 app.include_router(channel.router)
@@ -70,7 +72,7 @@ app.include_router(tool_proxy.router)
 
 app.mount("/static", StaticFiles(directory="templates/static"), name="static")
 app.mount("/photo", StaticFiles(directory="photo"), name="photo")
-# ↓wistaのサーバー認証偽装（必ず一番最後）
+
 @app.get("/{full_path:path}")
 async def spa_fallback(full_path: str):
     from fastapi.responses import Response
