@@ -25,30 +25,38 @@ def _text(value):
     return str(value or "")
 
 
-def _innertube_related_to_invidious(raw):
+def _video_id(item):
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("videoId") or item.get("video_id") or item.get("id") or "")
+
+
+def _normalize_related(raw):
     if isinstance(raw, dict):
-        items = raw.get("related") or raw.get("videos") or raw.get("items") or []
+        items = raw.get("relatedVideos") or raw.get("recommendedVideos") or raw.get("related") or raw.get("videos") or raw.get("items") or []
+    elif isinstance(raw, list):
+        items = raw
     else:
-        items = raw if isinstance(raw, list) else []
+        items = []
     out = []
     for item in items:
         if not isinstance(item, dict):
             continue
-        vid = item.get("videoId") or item.get("video_id") or item.get("id")
+        vid = _video_id(item)
         if not vid:
             continue
-        thumbs = item.get("thumbnails") or item.get("thumbnail") or []
+        thumbs = item.get("videoThumbnails") or item.get("thumbnails") or item.get("thumbnail") or []
         if isinstance(thumbs, dict):
             thumbs = thumbs.get("thumbnails") or []
         out.append({
-            "videoId": str(vid),
+            "videoId": vid,
             "title": _text(item.get("title") or item.get("headline")),
             "author": _text(item.get("author") or item.get("owner")),
             "authorId": item.get("authorId") or item.get("author_id") or item.get("channelId") or "",
             "lengthSeconds": item.get("lengthSeconds") or item.get("duration") or 0,
             "viewCount": item.get("viewCount") or item.get("view_count") or 0,
             "publishedText": _text(item.get("publishedText") or item.get("published")),
-            "authorThumbnails": [],
+            "authorThumbnails": item.get("authorThumbnails") or [],
             "videoThumbnails": thumbs if isinstance(thumbs, list) else [],
         })
     return out
@@ -59,7 +67,7 @@ async def _fetch_innertube_related(video_id: str):
         client = await get_client()
         resp = await client.get(f"{INNERTUBE_BASE}/video/{video_id}/related", timeout=12)
         resp.raise_for_status()
-        return _innertube_related_to_invidious(resp.json())
+        return _normalize_related(resp.json())
     except Exception:
         return []
 
@@ -69,17 +77,13 @@ async def _fetch_innertube_home():
         client = await get_client()
         resp = await client.get(f"{INNERTUBE_BASE}/home", timeout=15)
         resp.raise_for_status()
-        raw = resp.json()
-        # youtubei.js HomeFeed の items/videos から動画カードだけを抽出
-        items = raw.get("videos") or raw.get("items") or [] if isinstance(raw, dict) else []
-        return _innertube_related_to_invidious(items)
+        return _normalize_related(resp.json())
     except Exception:
         return []
 
 
 @router.get("/proxy/main/api/home")
 async def proxy_home():
-    """Home feed: Innertubeを優先し、YouTubeホームが空でも動画カードを返す。"""
     data = await _fetch_innertube_home()
     if data:
         return JSONResponse(data, headers={"X-Source": "innertube"})
@@ -104,14 +108,10 @@ async def proxy_main(path: str, request: Request):
         inv_cont_in = request.query_params.get("continuation")
         innertube_cont_key = _innertube_cont_get(channel_id, tab, inv_cont_in) if inv_cont_in else None
         invidious_task = asyncio.create_task(proxy_parallel(category, invidious_path, prefer_valid_videos=True))
-        if innertube_cont_key:
-            innertube_task = asyncio.create_task(fetch_innertube_continuation(innertube_cont_key))
-        else:
-            innertube_task = asyncio.create_task(fetch_innertube_videos(channel_id, tab))
-        innertube_result = ([], None)
+        innertube_task = asyncio.create_task(fetch_innertube_continuation(innertube_cont_key) if innertube_cont_key else fetch_innertube_videos(channel_id, tab))
         try:
             innertube_result = await asyncio.wait_for(innertube_task, timeout=8.0)
-        except (asyncio.TimeoutError, Exception):
+        except Exception:
             innertube_result = ([], None)
         try:
             inv_result = await invidious_task
@@ -141,14 +141,13 @@ async def proxy_main(path: str, request: Request):
                     fallback = await _fetch_innertube_related(video_id)
                     if fallback:
                         data["recommendedVideos"] = fallback
-                        data["_relatedSource"] = "innertube"
         return JSONResponse(data)
     except Exception as e:
         if category == "video":
             video_id = app_path.split("/api/stream/", 1)[-1].split("?", 1)[0]
             fallback = await _fetch_innertube_related(video_id) if video_id else []
             if fallback:
-                return JSONResponse({"recommendedVideos": fallback, "_source": "innertube"})
+                return JSONResponse({"recommendedVideos": fallback})
         return JSONResponse({"error": str(e)}, status_code=502)
 
 
